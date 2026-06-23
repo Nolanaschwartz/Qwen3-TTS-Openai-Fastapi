@@ -23,6 +23,124 @@ from .base import TTSBackend
 
 logger = logging.getLogger(__name__)
 
+# Leading noise gate for the START of a stream. The streaming decoder has a
+# cold-start that emits low-level junk BEFORE the first phoneme: a ~80ms
+# low-frequency thump at t=0, and a ~10ms broadband HF "static" tick right as the
+# first speech window is decoded. Both sit well below speech level (RMS <0.01 vs
+# speech RMS ~0.13), so we hold the output muted until a short-window RMS crosses
+# a threshold (= speech onset), then ramp in over a brief attack. This removes
+# both artifacts without clipping speech (a fixed-position fade could not, since
+# the tick lands at variable offset). Tunables (optimization.streaming):
+#   onset_gate_rms   — RMS threshold that counts as speech (0 disables gating)
+#   onset_attack_ms  — raised-cosine ramp length applied at the detected onset
+#   onset_max_lead_ms— safety: force the gate open after this much muted lead, so
+#                      a too-high threshold can never swallow a whole utterance
+_DEFAULT_ONSET_GATE_RMS = 0.05
+_DEFAULT_ONSET_ATTACK_MS = 10.0
+_DEFAULT_ONSET_MAX_LEAD_MS = 2000.0
+
+# Trailing-silence suppression. The talker emits ~0.6s of trailing silence before
+# EOS fires on short utterances, so a 0.5s "Yes." ships as a 1.5s clip that's
+# mostly dead air — the "drag" voice agents hear on short backchannels. We buffer
+# near-silent chunks once speech has started; an internal pause is preserved
+# (flushed when speech resumes), but the FINAL trailing run is dropped, keeping a
+# short natural tail. Tunables (optimization.streaming):
+#   tail_silence_rms — chunk RMS below this counts as silence (0 disables)
+#   tail_keep_ms     — natural tail kept after the last speech
+_DEFAULT_TAIL_SILENCE_RMS = 0.02
+_DEFAULT_TAIL_KEEP_MS = 120.0
+
+
+def _chunk_rms(chunk) -> float:
+    if chunk is None or len(chunk) == 0:
+        return 0.0
+    x = chunk.astype(np.float32, copy=False)
+    return float(np.sqrt(np.mean(x * x)))
+
+
+def _max_frames_for_text(text: str) -> int:
+    """Defensive per-input cap on generated codec frames. EOS normally fires far
+    sooner; this only bounds a runaway (no EOS) so it can never reach the 10000
+    default (~800s). ~12 frames/char is >2x the worst legit rate, capped at 2000
+    (~160s) for any single sentence/chunk."""
+    n = len(text or "")
+    return max(150, min(2000, n * 12))
+
+
+def _trim_silence_stream(source, gate_rms, attack_ms, max_lead_ms,
+                         tail_silence_rms, tail_keep_ms):
+    """Wrap a (chunk, sr) generator: drop leading silence (onset gate; fully-muted
+    lead chunks are skipped, not emitted) and suppress trailing silence."""
+    gate = {"open": gate_rms <= 0, "muted": 0}  # disabled gate => start open
+    buf = []  # buffered near-silent chunks (internal pause vs trailing silence)
+    for chunk, sr in source:
+        if not gate.get("open"):
+            gated = _gate_onset(chunk, sr, gate, gate_rms, attack_ms, max_lead_ms)
+            if not gate.get("open"):
+                continue  # still leading silence -> drop entirely (no dead air)
+            yield gated, sr  # gate opened on this chunk
+            continue
+        if tail_silence_rms > 0 and _chunk_rms(chunk) < tail_silence_rms:
+            buf.append((chunk, sr))  # hold: trailing silence or an internal pause?
+        else:
+            for b in buf:            # speech resumed -> it was a pause; keep it
+                yield b
+            buf.clear()
+            yield chunk, sr
+    # stream ended: the buffered run is trailing silence -> drop it, keep a short tail
+    if buf:
+        sr = buf[0][1]
+        keep = int(sr * tail_keep_ms / 1000.0)
+        if keep > 0:
+            joined = np.concatenate([c for c, _ in buf])
+            yield (joined[:keep] if len(joined) > keep else joined), sr
+
+
+def _gate_onset(chunk, sr, state, threshold, attack_ms, max_lead_ms):
+    """Mute leading sub-threshold junk; open with a raised-cosine attack at onset.
+
+    ``state`` is a per-stream dict {'open': bool, 'muted': int}. Returns the
+    (possibly muted/ramped) chunk; once open, chunks pass through unchanged.
+    """
+    if threshold <= 0 or state.get("open"):
+        return chunk
+    if chunk is None or len(chunk) == 0 or sr <= 0:
+        return chunk
+    x = chunk.astype(np.float32, copy=False)
+    win = max(1, int(sr * 0.008))  # 8ms moving-RMS window
+    csq = np.concatenate([[0.0], np.cumsum(x * x, dtype=np.float64)])
+    if len(x) >= win:
+        mrms = np.sqrt(np.maximum(csq[win:] - csq[:-win], 0.0) / win)
+        above = np.where(mrms > threshold)[0]
+    else:
+        above = np.array([], dtype=int)
+
+    if len(above) == 0:
+        # Whole chunk is sub-threshold: stay closed and emit silence — unless we
+        # have already muted too much (threshold likely too high for this voice).
+        state["muted"] = state.get("muted", 0) + len(x)
+        if state["muted"] >= int(sr * max_lead_ms / 1000.0):
+            state["open"] = True
+            return chunk
+        return np.zeros_like(x)
+
+    # Anchor onset at the END of the first above-threshold window: the forward
+    # moving-RMS crosses as soon as the window's leading edge touches rising
+    # energy, which is ~one window before speech is actually sustained. Using the
+    # window end places k inside solid speech so the muted region fully covers the
+    # pre-speech HF tick rather than ramping through it.
+    k = min(int(above[0]) + win, len(x))
+    a = int(sr * attack_ms / 1000.0)
+    out = x.copy()
+    s = max(0, k - a)
+    out[:s] = 0.0
+    n = k - s
+    if n > 1:
+        out[s:k] *= 0.5 * (1.0 - np.cos(np.linspace(0.0, np.pi, n, dtype=np.float32)))
+    state["open"] = True
+    return out
+
+
 # Location of the YAML config file (overridable via TTS_CONFIG env var)
 _DEFAULT_CONFIG_PATH = Path.home() / "qwen3-tts" / "config.yaml"
 
@@ -78,6 +196,38 @@ class OptimizedQwen3TTSBackend(TTSBackend):
         self.current_model_key: Optional[str] = None
         self._voice_prompt_cache: Dict[str, Any] = {}  # cache_key -> VoiceClonePromptItem list
         self._ready = False
+        # Optional fixed RNG seed for reproducible (deterministic) generation.
+        # None => random/varied output each call (sampling defaults).
+        self.seed: Optional[int] = self.config.get("seed", None)
+
+    def _apply_seed(self) -> None:
+        """Reseed torch RNGs before a generation so output is reproducible.
+
+        With a seed set, identical (text, speaker) input yields identical audio
+        and the speaker voice stays stable across requests. No-op when seed is None.
+        """
+        if self.seed is None:
+            return
+        import torch
+        torch.manual_seed(self.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(self.seed)
+
+    def _gen_kwargs(self) -> Dict[str, Any]:
+        """Sampling controls from config['generation'].
+
+        Lower randomness here = more stable speaker timbre across different
+        sentences. The sub-talker predicts the fine codec codes that carry the
+        voice's timbre, so its settings matter most (subtalker_dosample: false
+        locks timbre). Empty dict => model defaults (do_sample, temperature 0.9).
+        """
+        gen = self.config.get("generation", {})
+        keys = (
+            "do_sample", "temperature", "top_k", "top_p",
+            "subtalker_dosample", "subtalker_temperature",
+            "subtalker_top_k", "subtalker_top_p",
+        )
+        return {k: gen[k] for k in keys if k in gen}
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -135,6 +285,15 @@ class OptimizedQwen3TTSBackend(TTSBackend):
 
         opt = self.config.get("optimization", {})
         attn_impl = opt.get("attention", "flash_attention_2")
+
+        # cuDNN autotuning: the vocoder decoder is conv-heavy and streaming runs at
+        # a fixed window size, so benchmark mode picks the best conv kernels once and
+        # reuses them. Gated so it can be measured/disabled (optimization.cudnn_benchmark).
+        if self.device != "cpu" and opt.get("cudnn_benchmark", True):
+            torch.backends.cudnn.benchmark = True
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            logger.info("cuDNN benchmark + TF32 enabled")
 
         try:
             self.model = Qwen3TTSModel.from_pretrained(
@@ -326,11 +485,13 @@ class OptimizedQwen3TTSBackend(TTSBackend):
         model_key = self._default_model_key()
         await self._ensure_model_loaded(model_key)
 
+        self._apply_seed()
         wavs, sr = self.model.generate_custom_voice(
             text=text,
             language=language,
             speaker=voice,
             instruct=instruct,
+            **self._gen_kwargs(),
         )
 
         audio = wavs[0]
@@ -364,14 +525,25 @@ class OptimizedQwen3TTSBackend(TTSBackend):
         streaming_opts = self.config.get("optimization", {}).get("streaming", {})
         decode_window_frames = streaming_opts.get("decode_window_frames", 80)
         emit_every_frames = streaming_opts.get("emit_every_frames", 6)
+        gate_rms = streaming_opts.get("onset_gate_rms", _DEFAULT_ONSET_GATE_RMS)
+        attack_ms = streaming_opts.get("onset_attack_ms", _DEFAULT_ONSET_ATTACK_MS)
+        max_lead_ms = streaming_opts.get("onset_max_lead_ms", _DEFAULT_ONSET_MAX_LEAD_MS)
+        tail_rms = streaming_opts.get("tail_silence_rms", _DEFAULT_TAIL_SILENCE_RMS)
+        tail_keep_ms = streaming_opts.get("tail_keep_ms", _DEFAULT_TAIL_KEEP_MS)
 
-        for chunk, sr in self.model.stream_generate_custom_voice(
+        self._apply_seed()
+        source = self.model.stream_generate_custom_voice(
             text=text,
             speaker=voice,
             language=language,
             instruct=instruct,
             emit_every_frames=emit_every_frames,
             decode_window_frames=decode_window_frames,
+            max_frames=_max_frames_for_text(text),
+            **self._gen_kwargs(),
+        )
+        for chunk, sr in _trim_silence_stream(
+            source, gate_rms, attack_ms, max_lead_ms, tail_rms, tail_keep_ms
         ):
             yield chunk, sr
 
@@ -479,12 +651,21 @@ class OptimizedQwen3TTSBackend(TTSBackend):
             else:
                 logger.info(f"Voice prompt built (no cache): {time.time()-t0:.3f}s")
 
-        for chunk, sr in self.model.stream_generate_voice_clone(
+        gate_rms = streaming_opts.get("onset_gate_rms", _DEFAULT_ONSET_GATE_RMS)
+        attack_ms = streaming_opts.get("onset_attack_ms", _DEFAULT_ONSET_ATTACK_MS)
+        max_lead_ms = streaming_opts.get("onset_max_lead_ms", _DEFAULT_ONSET_MAX_LEAD_MS)
+        tail_rms = streaming_opts.get("tail_silence_rms", _DEFAULT_TAIL_SILENCE_RMS)
+        tail_keep_ms = streaming_opts.get("tail_keep_ms", _DEFAULT_TAIL_KEEP_MS)
+        source = self.model.stream_generate_voice_clone(
             text=text,
             language=language,
             voice_clone_prompt=prompt_items,
             emit_every_frames=emit_every_frames,
             decode_window_frames=decode_window_frames,
+            max_frames=_max_frames_for_text(text),
+        )
+        for chunk, sr in _trim_silence_stream(
+            source, gate_rms, attack_ms, max_lead_ms, tail_rms, tail_keep_ms
         ):
             yield chunk, sr
 

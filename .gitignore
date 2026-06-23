@@ -41,3 +41,7 @@ output/
 CLAUDE.md
 # Runtime server logs
 server_*.log
+*.log
+# Local env / secrets (never commit)
+.env
+.env.local

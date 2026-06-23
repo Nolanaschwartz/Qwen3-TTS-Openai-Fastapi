@@ -60,11 +60,13 @@ def _chunk_rms(chunk) -> float:
 
 def _max_frames_for_text(text: str) -> int:
     """Defensive per-input cap on generated codec frames. EOS normally fires far
-    sooner; this only bounds a runaway (no EOS) so it can never reach the 10000
-    default (~800s). ~12 frames/char is >2x the worst legit rate, capped at 2000
-    (~160s) for any single sentence/chunk."""
+    sooner; this only bounds a runaway (no EOS) so it can't reach the 10000 default
+    (~800s). Measured legit rate is ~1 frame/char (e.g. 34 chars -> ~32 frames);
+    ~4 frames/char is 4x headroom (never truncates real speech) while bounding a
+    runaway to ~4x instead of the old 12x (a 34-char runaway capped ~32s -> ~11s).
+    Floor 64 (~5s) for very short inputs; ceiling 1200 (~96s) per sentence."""
     n = len(text or "")
-    return max(150, min(2000, n * 12))
+    return max(64, min(1200, n * 4))
 
 
 def _trim_silence_stream(source, gate_rms, attack_ms, max_lead_ms,
@@ -226,6 +228,9 @@ class OptimizedQwen3TTSBackend(TTSBackend):
             "do_sample", "temperature", "top_k", "top_p",
             "subtalker_dosample", "subtalker_temperature",
             "subtalker_top_k", "subtalker_top_p",
+            # Anti-loop: higher discourages the talker from repeating frames and
+            # running away. Flows to stream_generate_pcm (streaming) + generate().
+            "repetition_penalty",
         )
         return {k: gen[k] for k in keys if k in gen}
 

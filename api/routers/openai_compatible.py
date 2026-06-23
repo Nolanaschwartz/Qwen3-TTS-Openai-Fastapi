@@ -732,6 +732,12 @@ async def create_speech(
                     total_samples = 0
                     chunk_count = 0
                     sample_rate = 24000
+                    # DIAGNOSTIC: log the exact input so a runaway (audio>>chars)
+                    # can be reproduced. Pair with the "TTS stream done" line below.
+                    logger.info(
+                        f"TTS stream req: chars={len(normalized_text)} "
+                        f"text={normalized_text[:300]!r}"
+                    )
                     async with _generation_semaphore:
                         async for pcm_chunk, sr in backend.generate_speech_streaming(
                             text=normalized_text,

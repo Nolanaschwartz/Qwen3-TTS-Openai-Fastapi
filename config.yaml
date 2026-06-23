@@ -26,6 +26,12 @@ generation:
   do_sample: true           # talker (coarse codes / prosody)
   temperature: 0.65
   top_k: 30
+  # Anti-loop / anti-runaway. A rare nondeterministic GPU divergence can make the
+  # talker sample a repeating frame and loop, deferring EOS -> audio 5-10x too long
+  # (the intermittent "dragging"). 1.05 (the generate() default) only softly
+  # discourages it; 1.3 forces progress to EOS. Raise toward 1.5 if runaways
+  # persist; lower toward 1.1 if speech sounds clipped/unnatural.
+  repetition_penalty: 1.3
   # Sub-talker = fine codes / TIMBRE. Kept MODERATE (0.55) so the *voice identity*
   # stays consistent across runs without flattening tone (fully greedy was dull).
   # This is the lever for tonality consistency; the talker above is the lever for

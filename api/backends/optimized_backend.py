@@ -69,6 +69,50 @@ def _max_frames_for_text(text: str) -> int:
     return max(64, min(1200, n * 4))
 
 
+# Calibrated native streaming duration model: dur(N) ~= overhead + N / asymptote
+# (measured 2026-06-23, seed 1234, Vivian: overhead 0.23s, asymptote ~15.3 ch/s).
+# Used to pick a per-reply tempo so rendered cadence hits a constant target ch/s
+# regardless of length — short replies (natively 8-10 ch/s from the fixed overhead)
+# speed up; long replies (already ~15 ch/s) stay near native.
+_SPEED_OVERHEAD_S = 0.23
+_SPEED_ASYMPTOTE_CHS = 15.3
+_SPEED_MIN = 0.85
+_SPEED_MAX = 1.5
+
+
+def _target_speed_for_text(n_chars, target_chs, overhead=_SPEED_OVERHEAD_S,
+                           asymptote=_SPEED_ASYMPTOTE_CHS,
+                           lo=_SPEED_MIN, hi=_SPEED_MAX):
+    """Tempo multiplier so an N-char reply renders at ~target_chs chars/sec.
+    Returns None if targeting is disabled. Clamped to [lo, hi]: very short replies
+    (e.g. 'Okay.', 5 chars) can't physically reach the target, so they hit hi and
+    land just under the band rather than turning into chipmunk speech."""
+    if not target_chs or target_chs <= 0 or n_chars <= 0:
+        return None
+    native_dur = overhead + n_chars / asymptote
+    target_dur = n_chars / target_chs
+    return float(min(hi, max(lo, native_dur / target_dur)))
+
+
+def _resolve_speed(text, request_speed, gen_cfg):
+    """Effective streaming tempo. An explicit per-request OpenAI speed (!=1.0) wins
+    outright; otherwise use the length-aware target cadence; otherwise the fixed
+    `generation.speed` fallback."""
+    if request_speed is not None and abs(request_speed - 1.0) > 1e-3:
+        return request_speed
+    ts = _target_speed_for_text(
+        len(text or ""),
+        gen_cfg.get("target_chars_per_sec", 0),
+        overhead=float(gen_cfg.get("speed_overhead_s", _SPEED_OVERHEAD_S)),
+        asymptote=float(gen_cfg.get("speed_asymptote_chars_per_sec", _SPEED_ASYMPTOTE_CHS)),
+        lo=float(gen_cfg.get("speed_min", _SPEED_MIN)),
+        hi=float(gen_cfg.get("speed_max", _SPEED_MAX)),
+    )
+    if ts is not None:
+        return ts
+    return float(gen_cfg.get("speed", 1.0) or 1.0)
+
+
 def _trim_silence_stream(source, gate_rms, attack_ms, max_lead_ms,
                          tail_silence_rms, tail_keep_ms):
     """Wrap a (chunk, sr) generator: drop leading silence (onset gate; fully-muted
@@ -96,6 +140,58 @@ def _trim_silence_stream(source, gate_rms, attack_ms, max_lead_ms,
         if keep > 0:
             joined = np.concatenate([c for c, _ in buf])
             yield (joined[:keep] if len(joined) > keep else joined), sr
+
+
+def _speed_stream(source, speed, context=1536, min_buf=3072):
+    """Pitch-preserving tempo change for a streaming (chunk, sr) float source.
+
+    Qwen3-TTS has no native rate control: short replies render at the correct
+    length but an unhurried cadence (~8-10 chars/s vs ~16 for longer text). This
+    speeds up delivery without shifting pitch via librosa's phase vocoder.
+
+    librosa.effects.time_stretch keeps no streaming state, so calling it per
+    chunk would reset phase at every seam and click. We carry a short tail of the
+    PRIOR raw input as phase context (overlap-save): each flush stretches
+    (context + new) then drops the first context/speed output samples, so the
+    emitted region continues seamlessly from the one before. speed>1 = faster /
+    snappier (and shorter, so RTF improves); speed<1 = slower. Chunks here are
+    float32 in [-1, 1] (encode_audio does the int16 step downstream)."""
+    if speed is None or abs(speed - 1.0) < 1e-3:
+        yield from source
+        return
+    try:
+        import librosa
+    except ImportError:
+        logger.warning("librosa unavailable; streaming speed=%.3f ignored", speed)
+        yield from source
+        return
+
+    ctx = np.zeros(0, dtype=np.float32)       # prior raw input tail (phase context)
+    pending = np.zeros(0, dtype=np.float32)   # input awaiting a large-enough flush
+    sr_out = 24000
+
+    def _flush(x):
+        nonlocal ctx
+        buf = np.concatenate([ctx, x]) if ctx.size else x
+        y = librosa.effects.time_stretch(buf.astype(np.float32), rate=speed)
+        drop = int(round(ctx.size / speed))   # discard the re-stretched context
+        out = y[drop:] if drop < y.size else y[:0]
+        ctx = np.ascontiguousarray(buf[-context:], dtype=np.float32)
+        return np.ascontiguousarray(out, dtype=np.float32)
+
+    for chunk, sr in source:
+        sr_out = sr
+        x = np.asarray(chunk, dtype=np.float32).reshape(-1)
+        pending = np.concatenate([pending, x]) if pending.size else x
+        if pending.size >= min_buf:
+            out = _flush(pending)
+            pending = np.zeros(0, dtype=np.float32)
+            if out.size:
+                yield out, sr_out
+    if pending.size:                          # final partial buffer
+        out = _flush(pending)
+        if out.size:
+            yield out, sr_out
 
 
 def _gate_onset(chunk, sr, state, threshold, attack_ms, max_lead_ms):
@@ -536,6 +632,10 @@ class OptimizedQwen3TTSBackend(TTSBackend):
         tail_rms = streaming_opts.get("tail_silence_rms", _DEFAULT_TAIL_SILENCE_RMS)
         tail_keep_ms = streaming_opts.get("tail_keep_ms", _DEFAULT_TAIL_KEEP_MS)
 
+        # Length-aware tempo so every reply renders near a constant target cadence
+        # (config generation.target_chars_per_sec); explicit per-request speed wins.
+        eff_speed = _resolve_speed(text, speed, self.config.get("generation", {}))
+
         self._apply_seed()
         source = self.model.stream_generate_custom_voice(
             text=text,
@@ -547,9 +647,10 @@ class OptimizedQwen3TTSBackend(TTSBackend):
             max_frames=_max_frames_for_text(text),
             **self._gen_kwargs(),
         )
-        for chunk, sr in _trim_silence_stream(
+        trimmed = _trim_silence_stream(
             source, gate_rms, attack_ms, max_lead_ms, tail_rms, tail_keep_ms
-        ):
+        )
+        for chunk, sr in _speed_stream(trimmed, eff_speed):
             yield chunk, sr
 
     async def generate_voice_clone(
@@ -623,6 +724,7 @@ class OptimizedQwen3TTSBackend(TTSBackend):
         ref_text: Optional[str] = None,
         language: str = "Auto",
         x_vector_only_mode: bool = False,
+        speed: float = 1.0,
         cache_key: Optional[str] = None,
     ) -> AsyncGenerator[Tuple[np.ndarray, int], None]:
         """
@@ -669,9 +771,11 @@ class OptimizedQwen3TTSBackend(TTSBackend):
             decode_window_frames=decode_window_frames,
             max_frames=_max_frames_for_text(text),
         )
-        for chunk, sr in _trim_silence_stream(
+        eff_speed = _resolve_speed(text, speed, self.config.get("generation", {}))
+        trimmed = _trim_silence_stream(
             source, gate_rms, attack_ms, max_lead_ms, tail_rms, tail_keep_ms
-        ):
+        )
+        for chunk, sr in _speed_stream(trimmed, eff_speed):
             yield chunk, sr
 
     # ------------------------------------------------------------------

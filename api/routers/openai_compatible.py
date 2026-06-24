@@ -631,6 +631,10 @@ async def create_speech(
                         backend.generate_voice_clone_streaming, "cache_key"
                     ):
                         clone_stream_kwargs["cache_key"] = canonical_key
+                    if _method_accepts_kwarg(
+                        backend.generate_voice_clone_streaming, "speed"
+                    ):
+                        clone_stream_kwargs["speed"] = request.speed
                     async with _generation_semaphore:
                         async for pcm_chunk, sr in backend.generate_voice_clone_streaming(
                             **clone_stream_kwargs,
@@ -744,6 +748,7 @@ async def create_speech(
                             voice=voice_name,
                             language=language,
                             instruct=request.instruct,
+                            speed=request.speed,
                             model=request.model,
                         ):
                             if pcm_chunk is not None and len(pcm_chunk) > 0:

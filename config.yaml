@@ -39,6 +39,27 @@ generation:
   subtalker_dosample: true  # sub-talker (fine codes / TIMBRE)
   subtalker_temperature: 0.45
   subtalker_top_k: 15
+  # CADENCE CONTROL (pitch-preserving tempo on the streamed audio). Qwen3-TTS has
+  # no native rate knob, and short replies drag: fixed per-utterance overhead pins
+  # them at ~8-10 chars/s while longer text runs at ~15. Instead of one fixed
+  # multiplier (which would over-speed long replies), we target a CONSTANT rendered
+  # cadence regardless of length — short replies get sped up, long ones stay ~native.
+  #   target_chars_per_sec: desired rendered rate. 14.5 = natural conversational.
+  #     Set to 0/null to disable targeting and use the fixed `speed` below instead.
+  target_chars_per_sec: 14.5
+  # Fixed-tempo fallback used only when target_chars_per_sec is disabled. Also the
+  # value an explicit per-request OpenAI `speed` overrides to (any speed != 1.0 from
+  # the client wins over the target). 1.0 = model's native rate.
+  speed: 1.0
+  # Calibration of the native streaming duration model dur(N) = overhead + N/asymptote
+  # (measured seed 1234 / Vivian). Re-measure if you change model/voice/seed and the
+  # rendered cadence drifts off target. Clamps bound the multiplier so tiny replies
+  # don't turn into chipmunk speech (they land just under target) and long replies
+  # aren't slowed too far.
+  speed_overhead_s: 0.23
+  speed_asymptote_chars_per_sec: 15.3
+  speed_min: 0.85
+  speed_max: 1.5
 
 # Available models.  Each entry maps a short name to a HuggingFace repo id (or
 # a local path) and a model type ("customvoice" or "base").

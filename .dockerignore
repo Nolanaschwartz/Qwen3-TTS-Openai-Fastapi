@@ -1,0 +1,25 @@
+# Local virtualenv (image builds its own /opt/venv)
+.venv
+venv
+# VCS / CI
+.git
+.github
+# Python caches
+__pycache__
+**/__pycache__
+*.pyc
+.pytest_cache
+.ov_cache
+.ov_models
+# Local artifacts / outputs
+out.wav
+*.wav
+server.log
+install.log
+voice_library
+# Editor / OS cruft
+.idea
+.vscode
+.DS_Store
+# Don't bake host env file into the image (config comes from compose)
+.env

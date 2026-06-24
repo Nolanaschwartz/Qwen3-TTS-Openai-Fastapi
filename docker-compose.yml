@@ -16,20 +16,45 @@ services:
       - PORT=8880
       - WORKERS=1
       - CORS_ORIGINS=*
-      - TTS_BACKEND=official
-      - TTS_WARMUP_ON_START=false
+      - TTS_BACKEND=optimized
+      # Optimized backend reads its model roster + compile knobs from this YAML
+      # (bind-mounted below so host edits are live without an image rebuild).
+      - TTS_CONFIG=/app/config.yaml
+      - TTS_MODEL_ID=Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice
+      # Eager-load at boot so the slow max-autotune + CUDA-graph compile happens
+      # during container startup, not on the first user request.
+      - TTS_LAZY_LOAD=false
+      - TTS_WARMUP_ON_START=true
+      # Auto-chunking: larger chunks + smaller gap (2026-06-22) so long text is
+      # split into fewer independent generations -> more continuous cadence and
+      # fewer artificial pauses across chunk boundaries. Trade-off: higher chunk
+      # max raises time-to-first-audio. Defaults were 70 / 120.
+      - TTS_MAX_CHUNK_CHARS=220
+      - TTS_CHUNK_GAP_MS=40
+      # NOTE: do NOT set TORCHINDUCTOR_COMPILE_THREADS=1 here. The streaming-decoder
+      # compile intermittently crashes on this GPU; with the default multi-thread
+      # compile that crash is isolated to a worker subprocess and caught as
+      # non-fatal. Forcing single-thread makes it crash the main process instead
+      # (SIGSEGV restart loop). Multi-thread isolation is what keeps the server up.
+      # Keep the server alive instead of self-terminating after 5 min idle
+      # (with restart:unless-stopped that would cause needless restart churn).
+      - TTS_IDLE_TIMEOUT_SECONDS=0
       # When using device_ids filter, the GPU appears as device 0 inside container
       - CUDA_VISIBLE_DEVICES=0
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     volumes:
       # Mount model cache for persistence
       - ~/.cache/huggingface:/home/appuser/.cache/huggingface
+      # Live-mount the optimized-backend config (TTS_CONFIG points here)
+      - ./config.yaml:/app/config.yaml:ro
+      # Live-mount the API source so backend code edits apply without a rebuild
+      - ./api:/app/api:ro
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ['2']
+              device_ids: ['0']
               capabilities: [gpu]
     restart: unless-stopped
     healthcheck:
@@ -37,7 +62,9 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 120s
+      # Wide grace period: first boot compiles (max-autotune + CUDA graphs),
+      # which can take several minutes before /health responds.
+      start_period: 360s
 
   # GPU-enabled service with vLLM-Omni backend
   qwen3-tts-vllm:

@@ -77,12 +77,29 @@ def _sample_next_token(
     top_k: int = 0,
     top_p: float = 1.0,
     suppress_tokens: Optional[list[int]] = None,
+    repetition_penalty: float = 1.0,
+    prev_tokens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Sample next token from logits with temperature, top-k, top-p and token suppression."""
+    """Sample next token from logits with temperature, top-k, top-p and token suppression.
+
+    repetition_penalty (>1.0) discourages re-emitting already-generated first-codebook tokens, matching
+    the non-streaming generate() path (HF CTRL-style penalty). Without it the streaming talker can loop
+    on acoustic frames and defer EOS, producing audio several times longer than the text (the dragging).
+    prev_tokens: 1-D tensor of first-codebook tokens generated so far (the penalty target history).
+    """
     # Suppress tokens by setting their logits to -inf
     if suppress_tokens is not None and len(suppress_tokens) > 0:
         logits = logits.clone()
         logits[..., suppress_tokens] = float("-inf")
+
+    # Repetition penalty (HF semantics): divide positive logits, multiply negative ones, for any token
+    # already produced. Applied to raw logits before temperature/top-k/top-p, as in transformers.
+    if repetition_penalty != 1.0 and prev_tokens is not None and prev_tokens.numel() > 0:
+        logits = logits.clone()
+        idx = prev_tokens.reshape(1, -1).to(logits.device)
+        score = torch.gather(logits, 1, idx)
+        score = torch.where(score < 0, score * repetition_penalty, score / repetition_penalty)
+        logits.scatter_(1, idx, score)
 
     if temperature <= 0:
         return torch.argmax(logits, dim=-1)
@@ -2615,6 +2632,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         decode_window_frames: int = 80,
         overlap_samples: int = 0,
         max_frames: int = 10000,
+        # Anti-repetition (mirrors non-streaming generate(); without it the talker over-generates)
+        repetition_penalty: float = 1.05,
         # Optimization flags
         use_optimized_decode: bool = True,
     ) -> Generator[tuple[np.ndarray, int], None, None]:
@@ -2691,12 +2710,16 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
 
         # Debug removed for performance: prefill done
 
+        # First-codebook tokens generated so far — the repetition-penalty history.
+        gen_tokens: list[torch.Tensor] = []
+
         # Sample first token from prefill logits
         last_logits = out.logits[:, -1, :]
         if do_sample:
             token = _sample_next_token(last_logits, temperature, top_k, top_p, suppress_tokens)
         else:
             token = torch.argmax(last_logits, dim=-1)
+        gen_tokens.append(token.detach().reshape(-1))
         # Debug removed for performance: first token sampled
 
         # Extract ref_code for decoder context (if in ICL mode)
@@ -2755,12 +2778,18 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             # Keep on GPU to avoid CPU<->GPU transfers during decode
             codes_buffer.append(codec_ids[0].detach())
 
-            # Sample next token for first codebook
+            # Sample next token for first codebook, penalizing already-generated tokens so the talker
+            # progresses toward EOS instead of looping (the over-generation/drag fix).
             step_logits = step_out.logits[:, -1, :]
             if do_sample:
-                token = _sample_next_token(step_logits, temperature, top_k, top_p, suppress_tokens)
+                prev = torch.cat(gen_tokens) if gen_tokens else None
+                token = _sample_next_token(
+                    step_logits, temperature, top_k, top_p, suppress_tokens,
+                    repetition_penalty=repetition_penalty, prev_tokens=prev,
+                )
             else:
                 token = torch.argmax(step_logits, dim=-1)
+            gen_tokens.append(token.detach().reshape(-1))
 
             frames_since_emit += 1
             if frames_since_emit < emit_every_frames:

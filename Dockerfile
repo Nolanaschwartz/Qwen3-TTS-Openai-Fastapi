@@ -101,7 +101,12 @@ RUN pip install --no-cache-dir \
 # Install ninja for faster flash-attn compilation
 RUN pip install --no-cache-dir ninja packaging wheel
 
-# Install flash-attention 2 for optimized attention (requires CUDA)
+# Install flash-attention 2 for optimized attention (requires CUDA).
+# Cap parallel build jobs: this host has many cores but limited RAM, and an
+# unconstrained flash-attn compile spawns one nvcc job per core (~3GB each),
+# which OOMs the machine. MAX_JOBS is overridable via --build-arg.
+ARG MAX_JOBS=4
+ENV MAX_JOBS=${MAX_JOBS}
 RUN pip install --no-cache-dir flash-attn --no-build-isolation
 
 # =============================================================================

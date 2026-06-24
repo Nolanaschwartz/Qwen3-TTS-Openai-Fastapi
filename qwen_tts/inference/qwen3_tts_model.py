@@ -781,7 +781,7 @@ class Qwen3TTSModel:
         gen_kwargs = self._merge_generate_kwargs(**kwargs)
         # Only keep params supported by stream_generate_pcm
         supported_params = {
-            "do_sample", "top_k", "top_p", "temperature",
+            "do_sample", "top_k", "top_p", "temperature", "repetition_penalty",
             "subtalker_dosample", "subtalker_top_k", "subtalker_top_p", "subtalker_temperature"
         }
         gen_kwargs = {k: v for k, v in gen_kwargs.items() if k in supported_params}
@@ -1084,7 +1084,7 @@ class Qwen3TTSModel:
 
         gen_kwargs = self._merge_generate_kwargs(**kwargs)
         supported_params = {
-            "do_sample", "top_k", "top_p", "temperature",
+            "do_sample", "top_k", "top_p", "temperature", "repetition_penalty",
             "subtalker_dosample", "subtalker_top_k", "subtalker_top_p", "subtalker_temperature"
         }
         gen_kwargs = {k: v for k, v in gen_kwargs.items() if k in supported_params}

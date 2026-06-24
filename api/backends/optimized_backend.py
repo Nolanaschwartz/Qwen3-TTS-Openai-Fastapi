@@ -142,56 +142,109 @@ def _trim_silence_stream(source, gate_rms, attack_ms, max_lead_ms,
             yield (joined[:keep] if len(joined) > keep else joined), sr
 
 
-def _speed_stream(source, speed, context=1536, min_buf=3072):
-    """Pitch-preserving tempo change for a streaming (chunk, sr) float source.
+def _speed_stream(source, speed, frame=1024, syn_hop=512, search=400):
+    """Pitch-preserving tempo change for a streaming (chunk, sr) float source via
+    streaming WSOLA (Waveform-Similarity Overlap-Add).
 
     Qwen3-TTS has no native rate control: short replies render at the correct
-    length but an unhurried cadence (~8-10 chars/s vs ~16 for longer text). This
-    speeds up delivery without shifting pitch via librosa's phase vocoder.
+    length but an unhurried cadence (~8-10 chars/s vs ~16 for longer text). We
+    speed up delivery without shifting pitch.
 
-    librosa.effects.time_stretch keeps no streaming state, so calling it per
-    chunk would reset phase at every seam and click. We carry a short tail of the
-    PRIOR raw input as phase context (overlap-save): each flush stretches
-    (context + new) then drops the first context/speed output samples, so the
-    emitted region continues seamlessly from the one before. speed>1 = faster /
-    snappier (and shorter, so RTF improves); speed<1 = slower. Chunks here are
-    float32 in [-1, 1] (encode_audio does the int16 step downstream)."""
+    A phase vocoder (librosa.time_stretch) does this but smears phase, adding a
+    robotic/echoey 'phasiness' on speech. WSOLA instead aligns each synthesis
+    frame to the previous one by waveform similarity (time-domain cross-correlation)
+    and overlap-adds with a Hann window, preserving local waveform shape — natural
+    voice, no echo. It runs as ONE continuous synthesis with only ~(frame+search)
+    samples (~60ms) of lookahead, so there are no per-chunk seams and TTFB is
+    barely affected. speed>1 = faster/shorter; speed<1 = slower. Chunks are float32
+    in [-1, 1] (encode_audio does the int16 step downstream)."""
     if speed is None or abs(speed - 1.0) < 1e-3:
         yield from source
         return
-    try:
-        import librosa
-    except ImportError:
-        logger.warning("librosa unavailable; streaming speed=%.3f ignored", speed)
-        yield from source
-        return
 
-    ctx = np.zeros(0, dtype=np.float32)       # prior raw input tail (phase context)
-    pending = np.zeros(0, dtype=np.float32)   # input awaiting a large-enough flush
-    sr_out = 24000
+    w = np.hanning(frame).astype(np.float32)
+    ov = syn_hop                                   # similarity / overlap length
+    ana_hop = max(1, int(round(syn_hop * speed)))  # input advance per frame
 
-    def _flush(x):
-        nonlocal ctx
-        buf = np.concatenate([ctx, x]) if ctx.size else x
-        y = librosa.effects.time_stretch(buf.astype(np.float32), rate=speed)
-        drop = int(round(ctx.size / speed))   # discard the re-stretched context
-        out = y[drop:] if drop < y.size else y[:0]
-        ctx = np.ascontiguousarray(buf[-context:], dtype=np.float32)
-        return np.ascontiguousarray(out, dtype=np.float32)
+    buf = np.zeros(0, dtype=np.float32)            # input[buf_start:]
+    buf_start = 0
+    a = 0                                          # next analysis pos (absolute)
+    s = 0                                          # next synthesis pos (absolute)
+    out_start = 0                                  # absolute index of oacc[0]
+    oacc = np.zeros(0, dtype=np.float32)           # output overlap-add accumulator
+    owin = np.zeros(0, dtype=np.float32)           # matching window-sum (for COLA norm)
+    natural = [None]                               # expected continuation (len ov)
 
+    def _process(final):
+        nonlocal buf, buf_start, a, s, out_start, oacc, owin
+        out = []
+        while True:
+            avail = buf_start + buf.size
+            if not final and a + search + frame > avail:
+                break                              # wait for more lookahead
+            if a + frame > avail:
+                break                              # nothing left to place
+            lo = max(buf_start, a - search)
+            hi = min(avail - ov, a + search)
+            if natural[0] is None or hi <= lo:
+                pos = min(a, avail - frame)
+            else:
+                region = buf[lo - buf_start: hi + ov - buf_start]
+                if region.size < ov:
+                    pos = min(a, avail - frame)
+                else:
+                    sc = np.correlate(region, natural[0], mode="valid")
+                    pos = lo + int(np.argmax(sc))
+            pos = min(max(pos, buf_start), avail - frame)
+            seg = buf[pos - buf_start: pos - buf_start + frame]
+            if seg.size < frame:
+                seg = np.concatenate([seg, np.zeros(frame - seg.size, np.float32)])
+            need = (s + frame) - out_start
+            if need > oacc.size:
+                g = need - oacc.size
+                oacc = np.concatenate([oacc, np.zeros(g, np.float32)])
+                owin = np.concatenate([owin, np.zeros(g, np.float32)])
+            i0 = s - out_start
+            oacc[i0:i0 + frame] += seg * w
+            owin[i0:i0 + frame] += w
+            nat0 = pos + syn_hop
+            if nat0 + ov <= avail:
+                natural[0] = buf[nat0 - buf_start: nat0 - buf_start + ov].copy()
+            else:
+                natural[0] = None
+            s += syn_hop
+            a += ana_hop
+            fin = s - out_start                    # samples < s are final
+            if fin > 0:
+                wn = owin[:fin].copy()
+                wn[wn < 1e-6] = 1.0
+                out.append((oacc[:fin] / wn).astype(np.float32))
+                oacc = oacc[fin:].copy()
+                owin = owin[fin:].copy()
+                out_start = s
+            keep = max(buf_start, a - search - frame)   # drop consumed input
+            if keep > buf_start:
+                buf = buf[keep - buf_start:].copy()
+                buf_start = keep
+        return out
+
+    sr_last = 24000
     for chunk, sr in source:
-        sr_out = sr
+        sr_last = sr
         x = np.asarray(chunk, dtype=np.float32).reshape(-1)
-        pending = np.concatenate([pending, x]) if pending.size else x
-        if pending.size >= min_buf:
-            out = _flush(pending)
-            pending = np.zeros(0, dtype=np.float32)
-            if out.size:
-                yield out, sr_out
-    if pending.size:                          # final partial buffer
-        out = _flush(pending)
-        if out.size:
-            yield out, sr_out
+        buf = np.concatenate([buf, x]) if buf.size else x
+        for oc in _process(final=False):
+            if oc.size:
+                yield oc, sr
+    for oc in _process(final=True):
+        if oc.size:
+            yield oc, sr_last
+    if oacc.size:                                  # leftover synthesized tail
+        wn = owin.copy()
+        wn[wn < 1e-6] = 1.0
+        tail = (oacc / wn).astype(np.float32)
+        if tail.size:
+            yield tail, sr_last
 
 
 def _gate_onset(chunk, sr, state, threshold, attack_ms, max_lead_ms):

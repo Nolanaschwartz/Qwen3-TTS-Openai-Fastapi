@@ -52,7 +52,13 @@ from qwen_tts.core.models.modeling_qwen3_tts import _sample_next_token  # noqa: 
 
 
 def load():
-    m = Qwen3TTSModel(MODEL_PATH)
+    # Correct loader (qwen3_tts_model.py:from_pretrained). Match your deploy's dtype/attn/device.
+    m = Qwen3TTSModel.from_pretrained(
+        MODEL_PATH,
+        device_map="cuda:0",
+        dtype=torch.bfloat16,
+        attn_implementation="flash_attention_2",
+    )
     m.model.eval()
     return m
 

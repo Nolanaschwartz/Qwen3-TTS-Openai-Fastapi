@@ -38,8 +38,8 @@ import soundfile as sf
 import torch
 
 # --- adjust these to your deployment ---------------------------------------------------------------
-MODEL_PATH = "Qwen/Qwen3-TTS-Flash"  # or your local 1.7B custom-voice checkpoint path
-SPEAKER = "alloy"                    # a supported custom-voice speaker
+MODEL_PATH = "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice"  # our deployed custom-voice checkpoint (cached)
+SPEAKER = "Eric"                     # real custom-voice speaker (raw model API; NOT an OpenAI alias)
 LANGUAGE = "English"
 TEXT_A = "I was just thinking about you earlier and wanted to check in."
 TEXT_B = " How are things feeling for you right now?"
@@ -49,6 +49,24 @@ DETERMINISTIC = True               # do_sample=False so reference vs streamed ar
 
 from qwen_tts.inference.qwen3_tts_model import Qwen3TTSModel  # noqa: E402  (the high-level wrapper)
 from qwen_tts.core.models.modeling_qwen3_tts import _sample_next_token  # noqa: E402
+
+# This model loops under plain greedy argmax (no EOS) — that's why the server runs
+# repetition_penalty=1.3. The prototype dropped it, so DETERMINISTIC=True ran the
+# reference away to the frame cap. Apply the SAME CTRL-style penalty deterministically
+# (penalize already-emitted first-codebook tokens, then argmax) so the A/B stays
+# bit-exact AND terminates at EOS.
+REP_PENALTY = 1.3
+
+
+def _greedy_penalized(logits, gen_tokens, suppress):
+    logits = logits.clone()
+    if suppress:
+        logits[:, suppress] = float("-inf")          # never pick invalid codec ids (eos kept)
+    if gen_tokens:
+        idx = torch.unique(torch.cat(gen_tokens))
+        s = logits[0, idx]
+        logits[0, idx] = torch.where(s < 0, s * REP_PENALTY, s / REP_PENALTY)
+    return torch.argmax(logits, dim=-1)
 
 
 def load():
@@ -75,7 +93,7 @@ def text_to_trailing(inner, ids_text):
 @torch.no_grad()
 def generate_collect_codes(inner, talker_input_embeds, talker_attention_mask, trailing, tts_pad_embed,
                            append_at=None, append_trailing=None, eos_trailing=None,
-                           max_frames=4000, do_sample=not DETERMINISTIC):
+                           max_frames=600, do_sample=not DETERMINISTIC):
     """A trimmed copy of stream_generate_pcm's TALKER loop (modeling_qwen3_tts.py:2611-2837) that COLLECTS
     all codec frames (no windowed streaming decode — we decode once at the end, which is enough to prove
     talker continuity). Optionally appends `append_trailing` (and finally `eos_trailing`) into the live
@@ -95,8 +113,12 @@ def generate_collect_codes(inner, talker_input_embeds, talker_attention_mask, tr
         generation_step=None, past_hidden=None, past_key_values=None,
     )
     pkv, past_hidden, gstep = out.past_key_values, out.past_hidden, out.generation_step
+    print(f"[diag] prefill -> gstep0={int(gstep)} trailing_len={int(trailing.shape[1])}")
     last = out.logits[:, -1, :]
-    token = _sample_next_token(last, 0.9, 50, 1.0, suppress) if do_sample else torch.argmax(last, dim=-1)
+    gen_tokens = []
+    token = (_sample_next_token(last, 0.9, 50, 1.0, suppress) if do_sample
+             else _greedy_penalized(last, gen_tokens, suppress))
+    gen_tokens.append(token.detach().reshape(-1))
 
     codes = []
     for step in range(max_frames):
@@ -104,10 +126,13 @@ def generate_collect_codes(inner, talker_input_embeds, talker_attention_mask, tr
         # the stream end early / a pad-burst, SPLIT_AFTER_FRAMES is too late vs the A text length, or the
         # split index below is wrong. Compare gstep here to the A trailing length.
         if append_at is not None and step == append_at and append_trailing is not None:
+            _before = int(trailing.shape[1])
             pieces = [trailing, append_trailing.to(device)]
             if eos_trailing is not None:
                 pieces.append(eos_trailing.to(device))
             trailing = torch.cat(pieces, dim=1)
+            print(f"[diag] APPEND at step={step} gstep={int(gstep)} "
+                  f"trailing {_before}->{int(trailing.shape[1])}")
 
         torch.compiler.cudagraph_mark_step_begin()
         step_out = inner.talker.forward(
@@ -118,10 +143,14 @@ def generate_collect_codes(inner, talker_input_embeds, talker_attention_mask, tr
         pkv, past_hidden, gstep = step_out.past_key_values, step_out.past_hidden, step_out.generation_step
         codec_ids = step_out.hidden_states[1]            # [B, num_code_groups]
         if codec_ids[0, 0] == eos_id:
+            print(f"[diag] EOS at step={step} gstep={int(gstep)} "
+                  f"frames={len(codes)} trailing_len={int(trailing.shape[1])}")
             break
         codes.append(codec_ids[0].detach())
         logits = step_out.logits[:, -1, :]
-        token = _sample_next_token(logits, 0.9, 50, 1.0, suppress) if do_sample else torch.argmax(logits, dim=-1)
+        token = (_sample_next_token(logits, 0.9, 50, 1.0, suppress) if do_sample
+                 else _greedy_penalized(logits, gen_tokens, suppress))
+        gen_tokens.append(token.detach().reshape(-1))
 
     return codes
 
@@ -135,11 +164,16 @@ def decode_codes(inner, codes):
     return wavs[0].astype(np.float32), sr
 
 
-def build(inner, text):
-    """Tokenize + build talker inputs for a whole utterance (reuses the model's own builder)."""
-    ids = inner._tokenize_texts([inner._build_assistant_text(text)])
+def build(m, text):
+    """Tokenize + build talker inputs for a whole utterance (reuses the model's own builder).
+    NOTE: _tokenize_texts/_build_assistant_text live on the WRAPPER (m); _build_talker_inputs
+    on the inner model (m.model). _build_talker_inputs requires instruct_ids/ref_ids/
+    voice_clone_prompt positionally — pass None for this plain custom-voice path."""
+    inner = m.model
+    ids = m._tokenize_texts([m._build_assistant_text(text)])
     tie, mask, trailing, pad = inner._build_talker_inputs(
-        input_ids=ids, speakers=[SPEAKER], languages=[LANGUAGE], non_streaming_mode=False,
+        input_ids=ids, instruct_ids=None, ref_ids=None, voice_clone_prompt=None,
+        speakers=[SPEAKER], languages=[LANGUAGE], non_streaming_mode=False,
     )
     return ids, tie, mask, trailing, pad
 
@@ -149,7 +183,7 @@ def main():
     inner = m.model  # the Qwen3TTSForConditionalGeneration
 
     # ---- reference: whole "A B" in one go ----
-    ids_ab, tie, mask, trailing_full, pad = build(inner, TEXT_A + TEXT_B)
+    ids_ab, tie, mask, trailing_full, pad = build(m, TEXT_A + TEXT_B)
     ref_codes = generate_collect_codes(inner, tie, mask, trailing_full, pad)
     ref_wav, sr = decode_codes(inner, ref_codes)
     sf.write("reference.wav", ref_wav, sr)
@@ -159,20 +193,25 @@ def main():
     # DEBUG(2): split index. trailing_full corresponds to input_id[:, 4:-5] of "A B" (modeling:2476-2478),
     # i.e. the TEXT tokens only, with a trailing eos hidden appended. We need (a) nA = #text-token positions
     # belonging to A, and (b) B's projected hiddens, and (c) the eos hidden (the last row of trailing_full).
-    ids_a = inner._tokenize_texts([inner._build_assistant_text(TEXT_A)])
+    ids_a = m._tokenize_texts([m._build_assistant_text(TEXT_A)])
     # text-token slice mirrors _build_talker_inputs line 2477: input_id[:, 4:-5]
     a_text_ids = ids_a[0][:, 4:-5]
     nA = a_text_ids.shape[1]
-    ids_b = inner._tokenize_texts([inner._build_assistant_text(TEXT_B)])
-    b_text_ids = ids_b[0][:, 4:-5]
-    trailing_A = trailing_full[:, :nA, :]                 # A's hiddens, no eos
-    trailing_B = text_to_trailing(inner, b_text_ids)      # B's hiddens, no eos
-    eos_hidden = trailing_full[:, -1:, :]                 # the eos row appended by the builder
+    # CLEAN go/no-go: split trailing_full (the SAME reference hiddens) at nA and reveal the
+    # tail LATE. generation_step advances 1/frame and consumes trailing[gstep]; if the tail is
+    # appended before gstep reaches nA, `trailing` equals trailing_full by the time it's needed,
+    # so deterministic decode must reproduce the reference exactly. (Separate re-tokenization of B
+    # — the real-world boundary case — is slice 2; this slice isolates the append mechanism.)
+    trailing_A = trailing_full[:, :nA, :]                 # A's hiddens (head of the joint render)
+    append_rest = trailing_full[:, nA:, :]                # the rest incl eos, revealed late
+    split = max(1, nA - 3)                                # append BEFORE gstep reaches nA
+    print(f"[diag] nA={nA} trailing_full={int(trailing_full.shape[1])} "
+          f"append_rest={int(append_rest.shape[1])} split_at={split}")
 
-    # Prefill with A-only trailing; append B+eos at SPLIT_AFTER_FRAMES.
+    # Prefill with A-only trailing; reveal the rest (B + eos) at `split` (< nA).
     stream_codes = generate_collect_codes(
         inner, tie, mask, trailing_A, pad,
-        append_at=SPLIT_AFTER_FRAMES, append_trailing=trailing_B, eos_trailing=eos_hidden,
+        append_at=split, append_trailing=append_rest, eos_trailing=None,
     )
     stream_wav, sr = decode_codes(inner, stream_codes)
     sf.write("streamed.wav", stream_wav, sr)

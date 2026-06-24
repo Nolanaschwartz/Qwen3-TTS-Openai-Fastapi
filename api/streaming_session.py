@@ -57,28 +57,32 @@ def _greedy_penalized(logits, gen_tokens, suppress, rep=_REP_PENALTY):
     return torch.argmax(logits, dim=-1)
 
 
-def _project_text(model, cumulative):
-    """Cumulative assistant-wrapped text -> projected trailing hiddens [1, T, H] (the same
-    projection _build_talker_inputs uses, so ids match the joint render -> same granularity)."""
-    inner = model.model
+def _text_token_ids(model, cumulative):
+    """Cumulative assistant-wrapped text -> text token ids [1, T] (same ids as the joint render,
+    so stable-prefix granularity matches a whole-text render)."""
     ids0 = model._tokenize_texts([model._build_assistant_text(cumulative)])[0]  # [1, T]
-    text_ids = ids0[:, 4:-5]                                                     # text tokens only
-    return inner.talker.text_projection(inner.talker.get_text_embeddings()(text_ids))
+    return ids0[:, 4:-5]                                                          # text tokens only
+
+
+def _project_ids(inner, ids):
+    """Project text token ids [1, k] -> trailing hiddens [1, k, H]. text_projection is a per-position
+    resize-MLP (two Linears + SiLU, no sequence mixing), so projecting a SLICE is bit-identical to
+    projecting the whole sequence and slicing — which lets us project only newly-committed rows
+    (O(delta)) instead of the whole cumulative every frame (was O(n) -> O(n^2) over the reply)."""
+    return inner.talker.text_projection(inner.talker.get_text_embeddings()(ids))
 
 
 def _decode_window(inner, codes_buffer, decode_window_frames, device):
-    """Decode the trailing `decode_window_frames` codes to a PCM wav (float). Uses the CUDA-graph
-    optimized streaming decoder when available/warmed, else the plain decoder (offline/fresh model)."""
+    """Decode the trailing `decode_window_frames` codes to a PCM wav (float).
+
+    NOTE: we use the plain decoder, NOT the CUDA-graph `decode_streaming(use_optimized=True)`
+    path the HTTP route uses — that graph is captured on the main thread and asserts when
+    replayed from this session's worker thread. The plain decode runs fine cross-thread (~7ms
+    warm, same talker-dominated RTF); only the FIRST session pays a one-time compile (~0.2s/
+    decode). A future main-thread/async rewrite could reclaim the graph path + kill the cold
+    start."""
     start = max(0, len(codes_buffer) - decode_window_frames)
     window = torch.stack(codes_buffer[start:], dim=0).to(device)
-    if hasattr(inner.speech_tokenizer, "decode_streaming"):
-        try:
-            wavs, sr = inner.speech_tokenizer.decode_streaming(
-                window, use_optimized=True, pad_to_size=decode_window_frames,
-            )
-            return wavs[0].astype(np.float32), sr
-        except Exception as exc:  # not warmed / shape mismatch -> plain decode
-            logger.debug("decode_streaming fell back to decode(): %s", exc)
     wavs, sr = inner.speech_tokenizer.decode([{"audio_codes": window}])
     return wavs[0].astype(np.float32), sr
 
@@ -131,9 +135,9 @@ def raw_session_pcm(model, text_q, speaker, language, *,
     )
     eos_hidden = trailing_full[:, -1:, :]
 
-    hid = _project_text(model, cumulative)
-    committed = max(0, hid.shape[1] - holdback)
-    trailing = hid[:, :committed, :]
+    ids = _text_token_ids(model, cumulative)
+    committed = max(0, ids.shape[1] - holdback)
+    trailing = _project_ids(inner, ids[:, :committed])   # [1, committed, H] (empty if committed==0)
 
     torch.compiler.cudagraph_mark_step_begin()
     out = inner.talker.forward(
@@ -154,10 +158,12 @@ def raw_session_pcm(model, text_q, speaker, language, *,
 
     def reproject(is_final):
         nonlocal trailing, committed
-        h = _project_text(model, cumulative)
-        stable = h.shape[1] if is_final else max(committed, h.shape[1] - holdback)
+        ids = _text_token_ids(model, cumulative)
+        T = ids.shape[1]
+        stable = T if is_final else max(committed, T - holdback)
         if stable > committed:
-            trailing = torch.cat([trailing, h[:, committed:stable, :]], dim=1)
+            hid = _project_ids(inner, ids[:, committed:stable])   # project ONLY the new rows
+            trailing = torch.cat([trailing, hid], dim=1)
             committed = stable
 
     while frames < max_frames:

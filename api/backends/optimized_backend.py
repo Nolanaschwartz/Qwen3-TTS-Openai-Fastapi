@@ -606,6 +606,23 @@ class OptimizedQwen3TTSBackend(TTSBackend):
             pass
         logger.info("Warmup complete (customvoice)")
 
+        # Warm the streaming-text session path too. It runs in a worker thread and uses the
+        # plain (non-CUDA-graph) decoder — distinct code from the optimized HTTP decode warmed
+        # above — so without this the FIRST WebSocket session pays a ~0.2s/decode compile.
+        try:
+            import queue as _queue
+            from ..streaming_session import stream_text_session, DONE as _DONE
+
+            _wq = _queue.Queue()
+            _wq.put("Warm up the streaming session decoder now.")
+            _wq.put(_DONE)
+            _opts = self.config.get("optimization", {}).get("streaming", {})
+            for _ in stream_text_session(self.model, _wq, "Eric", "English", 1.0, _opts):
+                pass
+            logger.info("Warmup: streaming-text session path")
+        except Exception as exc:  # never block startup on the session warm
+            logger.warning("session warmup skipped: %s", exc)
+
     # ------------------------------------------------------------------
     # TTSBackend interface — initialisation
     # ------------------------------------------------------------------

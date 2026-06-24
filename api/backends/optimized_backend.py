@@ -706,6 +706,19 @@ class OptimizedQwen3TTSBackend(TTSBackend):
         for chunk, sr in _speed_stream(trimmed, eff_speed):
             yield chunk, sr
 
+    def session_generator(self, text_q, speaker, language, speed, stop=None):
+        """Streaming-text session (approach B / WebSocket). SYNC generator meant to run in a
+        worker thread: yields (float_pcm_chunk, sr) as text deltas are pushed to `text_q`
+        (a queue.Queue; push streaming_session.DONE to end). `speed` is a fixed tempo (the
+        session can't know total length for length-aware cadence). `stop()` -> True aborts."""
+        from ..streaming_session import stream_text_session
+
+        self._apply_seed()
+        streaming_opts = self.config.get("optimization", {}).get("streaming", {})
+        return stream_text_session(
+            self.model, text_q, speaker, language, speed, streaming_opts, stop=stop
+        )
+
     async def generate_voice_clone(
         self,
         text: str,

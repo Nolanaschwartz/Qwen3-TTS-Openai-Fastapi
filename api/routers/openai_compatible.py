@@ -19,7 +19,17 @@ from typing import List, Optional
 
 import numpy as np
 import soundfile as sf
-from fastapi import APIRouter, HTTPException, Request, Response
+import queue
+import threading
+
+from fastapi import (
+    APIRouter,
+    HTTPException,
+    Request,
+    Response,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import StreamingResponse
 
 from ..structures.schemas import (
@@ -363,6 +373,144 @@ def _method_accepts_kwarg(method, kwarg: str) -> bool:
         param.kind == inspect.Parameter.VAR_KEYWORD
         for param in signature.parameters.values()
     )
+
+
+@router.websocket("/audio/stream")
+async def audio_stream(websocket: WebSocket):
+    """Streaming-text TTS session (approach B). Wire protocol:
+      client -> server (JSON text): {"type":"init","voice","language","format":"pcm",
+                                     "sample_rate":24000,"speed":1.0}
+                                    {"type":"text","text":<delta>}   (repeated)
+                                    {"type":"end"}
+      server -> client: binary 16-bit LE mono PCM @ sample_rate ; {"type":"error",...} on failure
+    Text deltas feed one continuous synthesis (append-mid-generation + pause-don't-pad);
+    PCM streams back over the same socket; server closes after the final frame.
+    """
+    await websocket.accept()
+    # The model is single-stream: reject if any generation (HTTP or another session) is in
+    # flight, using the same semaphore the HTTP paths hold, so a session and a request can
+    # never overlap (concurrent generations corrupt each other).
+    if _generation_semaphore.locked():
+        await websocket.send_text(
+            json.dumps({"type": "error", "message": "server busy: one stream at a time"})
+        )
+        await websocket.close()
+        return
+    async with _generation_semaphore:
+        await _run_audio_session(websocket)
+
+
+async def _run_audio_session(websocket: WebSocket):
+    loop = asyncio.get_running_loop()
+
+    # --- init frame ---
+    try:
+        init = json.loads(await websocket.receive_text())
+    except (WebSocketDisconnect, json.JSONDecodeError, RuntimeError):
+        await _safe_close(websocket)
+        return
+    if init.get("type") != "init":
+        await websocket.send_text(
+            json.dumps({"type": "error", "message": "first frame must be type=init"})
+        )
+        await _safe_close(websocket)
+        return
+
+    speaker = get_voice_name(init.get("voice", "alloy"))
+    language = init.get("language", "English")
+    try:
+        speed = float(init.get("speed", 1.0) or 1.0)
+    except (TypeError, ValueError):
+        speed = 1.0
+
+    backend = await get_tts_backend()
+    if not hasattr(backend, "session_generator"):
+        await websocket.send_text(
+            json.dumps({"type": "error", "message": "backend has no streaming session"})
+        )
+        await _safe_close(websocket)
+        return
+
+    text_q: "queue.Queue" = queue.Queue()
+    pcm_q: "asyncio.Queue" = asyncio.Queue()
+    stop = {"v": False}
+    DONE_SENTINEL = _streaming_done()
+    END = object()
+
+    def worker():
+        gen_start = time.time()
+        nbytes = 0
+        try:
+            for chunk, sr in backend.session_generator(
+                text_q, speaker, language, speed, stop=lambda: stop["v"]
+            ):
+                if stop["v"]:
+                    break
+                pcm16 = (np.clip(chunk, -1.0, 1.0) * 32767).astype("<i2").tobytes()
+                nbytes += len(pcm16)
+                loop.call_soon_threadsafe(pcm_q.put_nowait, pcm16)
+        except Exception as exc:  # surfaced to the client as an error frame
+            logger.exception("streaming session worker failed")
+            loop.call_soon_threadsafe(pcm_q.put_nowait, ("__error__", str(exc)))
+        finally:
+            logger.info(
+                "TTS session done: total=%.2fs audio=%.2fs",
+                time.time() - gen_start, (nbytes // 2) / 24000,
+            )
+            loop.call_soon_threadsafe(pcm_q.put_nowait, END)
+
+    worker_thread = threading.Thread(target=worker, name="tts-session", daemon=True)
+    worker_thread.start()
+
+    async def receiver():
+        """Pump client text frames into the generation queue."""
+        try:
+            while True:
+                msg = json.loads(await websocket.receive_text())
+                t = msg.get("type")
+                if t == "text":
+                    text_q.put(msg.get("text", ""))
+                elif t == "end":
+                    text_q.put(DONE_SENTINEL)
+                    return
+                # ignore unknown control frames
+        except (WebSocketDisconnect, RuntimeError, json.JSONDecodeError):
+            stop["v"] = True
+            text_q.put(DONE_SENTINEL)
+
+    recv_task = asyncio.create_task(receiver())
+    try:
+        while True:
+            item = await pcm_q.get()
+            if item is END:
+                break
+            if isinstance(item, tuple) and item and item[0] == "__error__":
+                await websocket.send_text(json.dumps({"type": "error", "message": item[1]}))
+                break
+            await websocket.send_bytes(item)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        stop["v"] = True
+        text_q.put(DONE_SENTINEL)  # unblock the worker if parked in the stall
+        recv_task.cancel()
+        await asyncio.gather(recv_task, return_exceptions=True)
+        await loop.run_in_executor(None, worker_thread.join, 5.0)
+        await _safe_close(websocket)
+
+
+def _streaming_done():
+    """The DONE sentinel from the streaming-session module (end-of-utterance marker)."""
+    from ..streaming_session import DONE
+
+    return DONE
+
+
+async def _safe_close(websocket: WebSocket):
+    try:
+        await websocket.close()
+    except Exception:
+        pass
 
 
 async def generate_speech(

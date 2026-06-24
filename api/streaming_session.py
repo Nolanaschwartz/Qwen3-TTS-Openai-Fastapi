@@ -26,6 +26,7 @@ compose unchanged — a stall is just a gap in emission the client's buffer abso
 
 import logging
 import queue
+import time
 
 import numpy as np
 import torch
@@ -120,9 +121,12 @@ def raw_session_pcm(model, text_q, speaker, language, *,
     done = False
 
     # --- wait for the first text (prefill needs at least chunk 0) ---
+    t_start = time.time()
     item = _get_text(text_q, stop)
     if item is DONE:
         return
+    ttft = time.time() - t_start          # idle wait for the LLM's first text frame
+    stall_s = 0.0                         # cumulative pause-don't-pad stall time (LLM lag mid-reply)
     cumulative += item
 
     # Prefill: only the first text token enters the prompt (input_id[3:4]), so building it
@@ -192,7 +196,9 @@ def raw_session_pcm(model, text_q, speaker, language, *,
         # pause-don't-pad: all real text consumed but more is coming -> STALL (no step)
         real_rows = trailing.shape[1] - (1 if eos_appended else 0)
         if gstep >= real_rows and not done:
+            _ts = time.time()
             it = _get_text(text_q, stop)
+            stall_s += time.time() - _ts                      # LLM lagged the talker here
             if it is DONE:
                 done = True
             else:
@@ -229,6 +235,18 @@ def raw_session_pcm(model, text_q, speaker, language, *,
         wav, sr = _decode_window(inner, codes_buffer, decode_window_frames, device)
         tail = spf * remaining
         yield (wav[-tail:] if tail > 0 else wav), sr
+
+    # Breakdown of where wall time went, so a real call separates LLM latency from TTS stalls:
+    #   ttft   = idle wait for the LLM's FIRST text frame (LLM time-to-first-token, not TTS)
+    #   stall  = pause-don't-pad time mid-reply (LLM fed slower than the talker consumed ~12.5 tok/s)
+    #   gen    = actual talker+decode work. gen/audio is the true RTF; high stall => speed up the LLM
+    elapsed = time.time() - t_start
+    gen = elapsed - ttft - stall_s
+    audio_s = len(codes_buffer) * spf / 24000.0
+    logger.info(
+        "session timing: ttft=%.2fs stall=%.2fs gen=%.2fs audio=%.2fs (genRTF=%.2f) text_tokens=%d",
+        ttft, stall_s, gen, audio_s, (gen / audio_s if audio_s else 0), committed,
+    )
 
 
 def stream_text_session(model, text_q, speaker, language, speed, streaming_opts, stop=None):

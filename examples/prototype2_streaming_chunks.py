@@ -80,15 +80,30 @@ def build_prefill(m, chunk0):
     return tie, mask, trailing0, eos_hidden, pad
 
 
-def chunk_hiddens(m, chunk):
-    """Tokenize ONE later chunk independently and project it to trailing hiddens. Slice [3:-5] (not [4:-5])
-    because, unlike chunk 0, no prefill consumes this chunk's first text token. (DEBUG: this slice is the
-    main thing to verify on GPU — wrong slice => dropped/duplicated word at each chunk boundary.)"""
+def build_stable_deltas(m, chunks, holdback=2):
+    """STABLE-PREFIX incremental tokenization (the slice-2 fix).
+
+    Independent per-chunk tokenization fragmented words at boundaries (29 tokens vs the joint
+    render's 21) because BPE merges differ when a word starts a chunk vs. follows context — so the
+    talker saw a lumpier token stream and rendered ~30% longer. Instead, tokenize the CUMULATIVE
+    text at each chunk and append only the newly-stable rows, holding back the last `holdback`
+    tokens (which may still re-merge as more text arrives). This reproduces the JOINT tokenization
+    incrementally: same token ids -> same projected hiddens -> same granularity as a whole-text
+    render. Held-back rows are delivered with the next chunk (or fully on the final chunk, since no
+    more text can change them). Returns one delta tensor [1, dT, H] per chunk."""
     inner = m.model
-    ids = m._tokenize_texts([m._build_assistant_text(chunk)])
-    text_ids = ids[0][:, 3:-5]
-    emb = inner.talker.get_text_embeddings()(text_ids)
-    return inner.talker.text_projection(emb)  # [1, T, H]
+    deltas, committed, cum = [], 0, ""
+    n = len(chunks)
+    for i, ch in enumerate(chunks):
+        cum += ch
+        ids0 = m._tokenize_texts([m._build_assistant_text(cum)])[0]      # [1, T]
+        text_ids = ids0[:, 4:-5]                                         # cumulative trailing target
+        hid = inner.talker.text_projection(inner.talker.get_text_embeddings()(text_ids))  # [1, T, H]
+        T = hid.shape[1]
+        stable = T if i == n - 1 else max(committed, T - holdback)       # final chunk: no holdback
+        deltas.append(hid[:, committed:stable, :])
+        committed = stable
+    return deltas
 
 
 def chunk_text(s):
@@ -199,10 +214,14 @@ def decode(inner, codes):
 
 def run_streamed(m, chunks, arrivals, pause, max_frames=600):
     inner = m.model
-    tie, mask, trailing0, eos_hidden, pad = build_prefill(m, chunks[0])
-    pending = [(arrivals[i], chunk_hiddens(m, chunks[i])) for i in range(1, len(chunks))]
-    print(f"[diag] chunks={len(chunks)} trailing0={int(trailing0.shape[1])} "
-          f"arrivals={[round(a,2) for a in arrivals[1:]]} pause={pause}")
+    # build_prefill gives the prompt (tie/mask), eos row and pad; its standalone trailing0 is
+    # discarded — trailing now comes from the cumulative stable-prefix deltas instead.
+    tie, mask, _t0, eos_hidden, pad = build_prefill(m, chunks[0])
+    deltas = build_stable_deltas(m, chunks)
+    trailing0 = deltas[0]                                   # chunk-0 stable rows -> initial trailing
+    pending = [(arrivals[i], deltas[i]) for i in range(1, len(chunks)) if deltas[i].shape[1] > 0]
+    print(f"[diag] chunks={len(chunks)} stable_deltas={[int(d.shape[1]) for d in deltas]} "
+          f"sum={sum(int(d.shape[1]) for d in deltas)} arrivals={[round(a,2) for a in arrivals]} pause={pause}")
     codes, stats = _decode_loop(inner, tie, mask, trailing0, pad, eos_hidden, pending, pause, max_frames)
     return codes, stats
 
